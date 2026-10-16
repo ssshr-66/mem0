@@ -296,6 +296,141 @@ def test_delete_all(memory_instance):
     assert result["message"] == "Memories deleted successfully!"
 
 
+def test_delete_all_bulk_clears_entity_store_once(memory_instance):
+    memories = [
+        Mock(
+            id=memory_id,
+            payload={
+                "data": f"Memory {memory_id}",
+                "created_at": "2024-01-01T00:00:00+00:00",
+                "user_id": "alice",
+            },
+        )
+        for memory_id in ("memory-1", "memory-2")
+    ]
+    entity = Mock(
+        id="entity-alice",
+        payload={
+            "data": "alice",
+            "user_id": "alice",
+            "linked_memory_ids": ["memory-1", "memory-2"],
+        },
+    )
+    entity_store = Mock()
+    entity_store.list.return_value = ([entity], None)
+    memory_instance._entity_store = entity_store
+    memory_instance.embedding_model = Mock()
+    memory_instance.embedding_model.embed = Mock(return_value=[0.1, 0.2, 0.3])
+    memory_instance.vector_store.list = Mock(side_effect=[(memories, None), ([], None)])
+    memories_by_id = {memory.id: memory for memory in memories}
+    memory_instance.vector_store.get.side_effect = lambda vector_id: memories_by_id[vector_id]
+    memory_instance.db.add_history = Mock()
+
+    result = memory_instance.delete_all(user_id="alice")
+
+    assert result["message"] == "Memories deleted successfully!"
+    assert memory_instance.vector_store.delete.call_count == 2
+    assert memory_instance.db.add_history.call_count == 2
+    entity_store.list.assert_called_once_with(filters={"user_id": "alice"}, top_k=10000)
+    entity_store.delete.assert_called_once_with(vector_id="entity-alice")
+    memory_instance.embedding_model.embed.assert_not_called()
+
+
+def test_delete_all_partial_failure_cleans_only_completed_memories(memory_instance):
+    memories = [
+        Mock(
+            id=memory_id,
+            payload={
+                "data": f"Memory {memory_id}",
+                "created_at": "2024-01-01T00:00:00+00:00",
+                "user_id": "alice",
+                "agent_id": "agent-a",
+            },
+        )
+        for memory_id in ("memory-1", "memory-2")
+    ]
+    entity = Mock(
+        id="entity-alice",
+        payload={
+            "data": "alice",
+            "user_id": "alice",
+            "agent_id": "agent-a",
+            "linked_memory_ids": ["memory-1", "memory-2"],
+        },
+    )
+    entity_store = Mock()
+    entity_store.list.return_value = ([entity], None)
+    memory_instance._entity_store = entity_store
+    memory_instance.vector_store.list.return_value = (memories, None)
+    memories_by_id = {memory.id: memory for memory in memories}
+    memory_instance.vector_store.get.side_effect = lambda vector_id: memories_by_id[vector_id]
+    failure = RuntimeError("vector delete failed")
+    memory_instance.vector_store.delete.side_effect = [None, failure]
+    memory_instance.embedding_model = Mock()
+    memory_instance.embedding_model.embed = Mock(return_value=[0.1, 0.2, 0.3])
+    memory_instance.db.add_history = Mock()
+
+    with pytest.raises(RuntimeError, match="vector delete failed") as exc_info:
+        memory_instance.delete_all(user_id="alice")
+
+    assert exc_info.value is failure
+    entity_store.list.assert_called_once_with(
+        filters={"user_id": "alice", "agent_id": "agent-a"},
+        top_k=10000,
+    )
+    entity_store.update.assert_called_once()
+    assert entity_store.update.call_args.kwargs["payload"]["linked_memory_ids"] == ["memory-2"]
+
+
+def test_delete_all_repeated_batch_cleans_completed_memory_scope(memory_instance):
+    memory = Mock(
+        id="memory-1",
+        payload={
+            "data": "Memory one",
+            "created_at": "2024-01-01T00:00:00+00:00",
+            "user_id": "alice",
+            "agent_id": "agent-a",
+        },
+    )
+    entity = Mock(
+        id="entity-alice",
+        payload={
+            "data": "alice",
+            "user_id": "alice",
+            "agent_id": "agent-a",
+            "linked_memory_ids": ["memory-1"],
+        },
+    )
+    entity_store = Mock()
+    entity_store.list.return_value = ([entity], None)
+    memory_instance._entity_store = entity_store
+    memory_instance.vector_store.list.side_effect = [([memory], None), ([memory], None)]
+    memory_instance.vector_store.get.return_value = memory
+    memory_instance.db.add_history = Mock()
+
+    result = memory_instance.delete_all(user_id="alice")
+
+    assert result["message"] == "Memories deleted successfully!"
+    assert memory_instance.vector_store.delete.call_count == 1
+    entity_store.list.assert_called_once_with(
+        filters={"user_id": "alice", "agent_id": "agent-a"},
+        top_k=10000,
+    )
+    entity_store.delete.assert_called_once_with(vector_id="entity-alice")
+
+
+def test_delete_all_with_no_memories_does_not_touch_entity_store(memory_instance):
+    entity_store = Mock()
+    memory_instance._entity_store = entity_store
+    memory_instance.vector_store.list.return_value = ([], None)
+
+    result = memory_instance.delete_all(user_id="alice")
+
+    assert result["message"] == "Memories deleted successfully!"
+    entity_store.list.assert_not_called()
+    entity_store.delete.assert_not_called()
+
+
 def test_delete_all_paginates_beyond_vector_store_page_size(memory_instance):
     first_batch = [Mock(id=str(index)) for index in range(1000)]
     second_batch = [Mock(id="1000")]
